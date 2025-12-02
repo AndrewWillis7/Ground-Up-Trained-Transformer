@@ -159,7 +159,11 @@ class Tensor:
     def gelu(self):
         c = np.sqrt(2/np.pi).astype(np.float32)
         x = self.data
-        out_data = 0.5 * x * (1 + np.tanh(c * (x + 0.044715 * (x**3))))
+
+        u = x + 0.044715 * (x ** 3)
+        u = np.clip(u, -50.0, 50.0)
+
+        out_data = 0.5 * x * (1 + np.tanh(0.79788456 * (c * u)))
         out = Tensor(out_data, requires_grad=self.requires_grad, _children=(self,), _op="gelu")
         def _backward():
             if not self.requires_grad: return
