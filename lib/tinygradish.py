@@ -26,6 +26,7 @@ class Tensor:
         return f"Tensor(shape={self.data.shape}, requires_grad={self.requires_grad})"
     
     # Core graph utilities
+    @staticmethod
     def _ensure_tensor(x):
         return x if isinstance(x, Tensor) else Tensor(x)
     
@@ -88,6 +89,7 @@ class Tensor:
     
     def __matmul__(self, other): return self.matmul(other)
 
+    @property
     def T(self):
         out = Tensor(self.data.transpose(), requires_grad=self.requires_grad, _children=(self,), _op="transpose")
         def _backward():
@@ -186,8 +188,35 @@ class Tensor:
         return out
     
     def softmax(self, axis=-1):
-        y = self.log_softmax(axis=axis)
-        return Tensor(np.exp(y.data), requires_grad=y.requires_grad, _children=(y,), _op="exp")
+        y = self.log_softmax(axis=axis)   # y = log softmax(x)
+        out_data = np.exp(y.data)         # true softmax values
+
+        out = Tensor(
+            out_data,
+            requires_grad=y.requires_grad,
+            _children=(y,),
+            _op="softmax"
+        )
+
+        def _backward():
+            if not y.requires_grad:
+                return
+
+            g = out.grad
+            s = out.data
+
+            # Jacobian-vector product:
+            # dL/dx = g - s * sum(g * s)
+            dot = np.sum(g * s, axis=axis, keepdims=True)
+
+            if y.grad is None:
+                y.grad = np.zeros_like(y.data)
+
+            y.grad += g - dot * s
+
+        out._backward = _backward
+        return out
+
     
     # ----- backprop entry -----
     def backward(self):
@@ -214,7 +243,7 @@ class Parameter(Tensor):
 
 class Module:
     def __init__(self):
-        self.parameters = {}
+        self._parameters = {}
         self._modules = {}
         self.training = True
         pass
@@ -252,7 +281,8 @@ class Module:
     
     def zero_grad(self):
         for p in self.parameters():
-            p.grad.fill(0.0)
+            if p.grad is not None:
+                p.grad.fill(0.0)
 
 # Layers
 class Linear(Module):
@@ -280,21 +310,61 @@ class LayerNorm(Module):
     def __init__(self, dim, eps=1e-5):
         super().__init__()
         self.gamma = self.add_parameter('gamma', Parameter(np.ones((dim,), dtype=np.float32)))
-        self.beta = self.add_parameter('beta', Parameter(np.zeros((dim,), dtype=np.float32)))
+        self.beta  = self.add_parameter('beta',  Parameter(np.zeros((dim,), dtype=np.float32)))
         self.eps = eps
 
     def forward(self, x: Tensor):
         # x: (..., D)
-        x_mu = Tensor(np.mean(x.data, axis=-1, keepdims=True))
-        x_var = Tensor(np.var(x.data, axis=-1, keepdims=True))
-        x_center = x - x_mu
-        std = Tensor(1.0 / np.sqrt(x_var.data + self.eps))
-        x_hat = x_center * std
+        D = x.data.shape[-1]
 
-        # broadcast gamma/beta
-        y = x_hat * self.gamma.reshape(*([1]*(x_hat.data.ndim-1)), -1) + self.beta.reshape(*([1]*(x_hat.data.ndim-1)), -1)
-        # hook grads manually so gamma/beta get gradients from y
+        # Compute batch statistics (in NumPy)
+        mu = np.mean(x.data, axis=-1, keepdims=True)
+        var = np.var(x.data, axis=-1, keepdims=True)
+        std = np.sqrt(var + self.eps)
+
+        x_mu = x.data - mu
+        x_hat = x_mu / std
+
+        # Output tensor
+        y = Tensor(
+            x_hat * self.gamma.data + self.beta.data,
+            requires_grad=x.requires_grad or self.gamma.requires_grad or self.beta.requires_grad,
+            _children=(x, self.gamma, self.beta),
+            _op="layernorm"
+        )
+
+        def _backward():
+            gy = y.grad  # gradient w.r.t. output
+
+            if gy is None:
+                return
+
+            # gamma / beta grads
+            if self.gamma.requires_grad:
+                if self.gamma.grad is None:
+                    self.gamma.grad = np.zeros_like(self.gamma.data)
+                self.gamma.grad += np.sum(gy * x_hat, axis=tuple(range(gy.ndim-1)), keepdims=False)
+
+            if self.beta.requires_grad:
+                if self.beta.grad is None:
+                    self.beta.grad = np.zeros_like(self.beta.data)
+                self.beta.grad += np.sum(gy, axis=tuple(range(gy.ndim-1)), keepdims=False)
+
+            # input gradients (LayerNorm full formula)
+            if x.requires_grad:
+                if x.grad is None:
+                    x.grad = np.zeros_like(x.data)
+
+                gx_hat = gy * self.gamma.data
+                gx_mu = gx_hat / std
+                gvar = np.sum(gx_hat * x_mu * -0.5 * std**-3, axis=-1, keepdims=True)
+                gmu = np.sum(-gx_mu, axis=-1, keepdims=True) + gvar * np.mean(-2 * x_mu, axis=-1, keepdims=True)
+
+                x.grad += gx_mu + (gvar * 2 * x_mu / D) + (gmu / D)
+
+        y._backward = _backward
         return y
+
 
 class Dropout(Module):
     def __init__(self, p=0.5):
@@ -344,7 +414,8 @@ class Optimizer:
 
     def zero_grad(self):
         for p in self.params:
-            p.grad.fill(0.)
+            if p.grad is not None:
+                p.grad.fill(0.)
 
 class SGD(Optimizer):
     def __init__(self, params, lr=1e-2, weight_decay=0.0):
